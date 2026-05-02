@@ -79,7 +79,13 @@ class PipelineABC(ABC):
                 memory_budget_mb=self.physical_memory_budget_mb,
             )
             if self.apply_physical_reordering:
-                self.op_runtimes = self.physical_optimizer.maybe_reorder(self.op_runtimes, self.physical_plan)
+                # honor pipeline-level toggle by enabling optimizer reorder switch for this call
+                prev_enable_reorder = self.physical_optimizer.enable_reorder
+                self.physical_optimizer.enable_reorder = True
+                try:
+                    self.op_runtimes = self.physical_optimizer.maybe_reorder(self.op_runtimes, self.physical_plan)
+                finally:
+                    self.physical_optimizer.enable_reorder = prev_enable_reorder
                 # Keep execution graph in sync with reordered runtimes
                 self._reset_compiled_graph_state()
                 self._build_operator_nodes_graph()
@@ -127,7 +133,7 @@ class PipelineABC(ABC):
                 if isinstance(v, LLM_SERVING_CLASSES):
                     llm_serving_obj = v
             # get storage object from the function dict
-            storage_obj = op_runtime.kwargs.pop("storage", None)
+            storage_obj = op_runtime.kwargs.get("storage", None)
             
             assert isinstance(storage_obj, DataFlowStorage), f"Storage must be a DataFlowStorage object, but got {type(storage_obj)} in {op_runtime}'s `run` function with key `storage`."
             
