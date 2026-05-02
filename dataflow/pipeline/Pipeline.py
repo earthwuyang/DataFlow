@@ -15,6 +15,10 @@ from datetime import datetime
 from dataflow.logger import get_logger
 import colorsys
 from tqdm import tqdm
+from dataflow.planner.physical_optimizer import PhysicalPlanOptimizer
+from dataflow.planner.dynamic_batching import DynamicBatchController, DynamicBatchState
+from dataflow.planner.telemetry import TelemetryStore
+from dataflow.planner.runtime_apply import apply_physical_plan_end_to_end, update_cost_model_from_telemetry
 class PipelineABC(ABC):
     def __init__(self):
         # list of dict, contains `OPRuntime` class and parameters for `operator.run()`
@@ -32,6 +36,17 @@ class PipelineABC(ABC):
         self.op_nodes_list : list[OperatorNode] = []
         self.llm_serving_list = [] # list of LLMServing objects
         self.llm_serving_counter = Counter() # count of LLMServing objects
+
+        # physical optimizer artifacts
+        self.physical_plan = None
+        self.physical_optimizer = PhysicalPlanOptimizer(enable_reorder=False)
+        self.enable_physical_planning = True
+        self.apply_physical_reordering = False
+        self.physical_memory_budget_mb = None
+        self.enable_dynamic_batching = False
+        self.dynamic_batch_controller = DynamicBatchController()
+        self.dynamic_batch_states = {}
+        self.telemetry_store = TelemetryStore()
     
     @abstractmethod
     def forward(self):
@@ -53,10 +68,43 @@ class PipelineABC(ABC):
             f"Compiling pipeline and validating key integrity "
             f"across {len(self.op_runtimes)} operator runtimes."
         )
+        # build operator graph first to preserve compile-time behavior
         self._build_operator_nodes_graph()
+
+        # plan-only by default: attach physical plan summary without mutating runtime order
+        if self.enable_physical_planning:
+            self.physical_plan = self.physical_optimizer.build_plan(
+                list(self.op_runtimes),
+                memory_budget_mb=self.physical_memory_budget_mb,
+            )
+            if self.apply_physical_reordering:
+                self.op_runtimes = self.physical_optimizer.maybe_reorder(self.op_runtimes, self.physical_plan)
         # self._draw_graph_for_operators()
         # self._build_serving_resources_map()
         
+
+    def suggest_dynamic_batch_size(self, op_name: str, observed_latency_ms: float, oom: bool = False, profile: dict | None = None, target_latency_ms: float | None = None) -> int:
+        """Update and return next runtime batch size for an operator.
+
+        This helper enables feedback-driven dynamic batching decisions and can be
+        called by runtime/scheduler integrations.
+        """
+        if op_name not in self.dynamic_batch_states:
+            self.dynamic_batch_states[op_name] = DynamicBatchState(target_latency_ms=target_latency_ms)
+        state = self.dynamic_batch_states[op_name]
+        if target_latency_ms is not None:
+            state.target_latency_ms = target_latency_ms
+        return self.dynamic_batch_controller.update(state, observed_latency_ms=observed_latency_ms, oom=oom, profile=profile)
+
+
+    def apply_planner_decisions(self, num_gpus: int = 1) -> dict:
+        """Apply planner rewrite + placement directives end-to-end (metadata level)."""
+        return apply_physical_plan_end_to_end(self.op_runtimes, num_gpus=num_gpus)
+
+    def profile_and_update_cost_model(self):
+        """Update operator physical profiles using collected runtime telemetry."""
+        update_cost_model_from_telemetry(self.op_runtimes, self.telemetry_store)
+
     def _build_operator_nodes_graph(self):
         """
         Build a graph of operator nodes, each node contains the operator object and its storage.
